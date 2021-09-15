@@ -1,9 +1,9 @@
 " plugin/autocmds.vim
 " -------------------
 "
-" Copyright 2021 Lawrence Velázquez
-"
 " SPDX-License-Identifier: MIT
+"
+" Copyright 2021 Lawrence Velázquez
 "
 " Permission is hereby granted, free of charge, to any person obtaining
 " a copy of this software and associated documentation files (the
