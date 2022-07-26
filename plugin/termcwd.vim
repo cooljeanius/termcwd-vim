@@ -1,9 +1,9 @@
-" plugin/autocmds.vim
+" plugin/termcwd.vim
 " -------------------
 "
 " SPDX-License-Identifier: MIT
 "
-" Copyright 2021 Lawrence Velázquez
+" Copyright 2021-2022 Lawrence Velázquez
 "
 " Permission is hereby granted, free of charge, to any person obtaining
 " a copy of this software and associated documentation files (the
@@ -43,14 +43,18 @@ set cpoptions&vim
 function! s:BasicHandler(doc) abort
     if &buftype ==# '' || &buftype ==# 'nowrite' || &buftype ==# 'help'
         " The buffer is associated with a file.
-        call s:SetCwds(getcwd(), a:doc)
+        let l:dir = getcwd()
+        let l:doc = a:doc
     elseif &buftype ==# 'terminal' || &buftype ==# 'prompt'
         " The buffer is intended for use with external jobs.
-        call s:SetCwds('', '')
+        let l:dir = ''
+        let l:doc = ''
     else
         " The buffer is not associated with a file.
-        call s:SetCwds(getcwd(), '')
+        let l:dir = getcwd()
+        let l:doc = ''
     endif
+    call s:SetCwds(l:dir, l:doc, s:SendCtrlSeq)
 endfunction
 
 
@@ -72,10 +76,71 @@ endfunction
 " until they switch windows or buffers.)
 "
 " TODO: Look into whether the quickfix window needs similar treatment.
+" TODO: See if getcmdwintype() would be useful for this.
 function! s:BufFilePostHandler() abort
     if expand('<afile>') !=# '[Command Line]' && expand('<amatch>')[0] !=# '!'
         call s:StdHandler()
     endif
+endfunction
+
+
+" Returns a Funcref to a function that accepts a control sequence [1][2]
+" as a String argument and passes it to the underlying terminal.
+function! s:ChooseSendCtrlSeq() abort
+    " TODO: Look into handling Vim terminal buffers.
+    if $TMUX isnot ''
+        let l:sendctrlseq = 'termcwd#tmux#SendCtrlSeq'
+    elseif &term =~# '^screen\d*\%(-[^-]\|\.[^.]\|$\)'
+                \ || $TERMCAP =~# '^SC|screen\d*\%(-[^-]\|\.[^.]\|[|:]\)'
+        let l:sendctrlseq = 'termcwd#screen#SendCtrlSeq'
+    else
+        let l:sendctrlseq = 'termcwd#SendCtrlSeq'
+    endif
+
+    if v:version < 702 || (v:version == 702 && !has('patch061'))
+        " Creating an autoloading Funcref fails if the function's script
+        " hasn't been sourced yet.  Call the function to force sourcing,
+        " but intentionally pass too few arguments so it does nothing.
+        try
+            call call(l:sendctrlseq, [])
+        catch /\m\C^Vim(call):E119:/
+        endtry
+    endif
+
+    return function(l:sendctrlseq)
+endfunction
+
+
+" Returns a Funcref to a function that can set the terminal's current
+" directory and document.  The function accepts a directory path as the
+" first argument, a file path as the second, and a Funcref returned by
+" s:ChooseSendCtrlSeq() as the third.  Either path argument may be empty
+" to indicate that the corresponding state should be cleared.  Arguments
+" that the terminal cannot use are ignored.
+"
+" Throws an exception if the current terminal is not supported.
+function! s:ChooseSetCwds() abort
+    " TODO: Identify terminals in tmux sessions, where TERM_PROGRAM and
+    " TERM are changed.  Turns out that `tmux show-environment` doesn't
+    " do what I need, so I don't know what to try now.
+    if $TERM_PROGRAM ==# 'Apple_Terminal'
+                \ || &term =~# '^nsterm-\|^nsterm$\|^Apple_Terminal$'
+        let l:setcwds = 'termcwd#nsterm#SetCwds'
+    else
+        throw 'termcwd(ChooseSetCwds):unsupported terminal'
+    endif
+
+    if v:version < 702 || (v:version == 702 && !has('patch061'))
+        " Creating an autoloading Funcref fails if the function's script
+        " hasn't been sourced yet.  Call the function to force sourcing,
+        " but intentionally pass too few arguments so it does nothing.
+        try
+            call call(l:setcwds, [])
+        catch /\m\C^Vim(call):E119:/
+        endtry
+    endif
+
+    return function(l:setcwds)
 endfunction
 
 
@@ -103,18 +168,17 @@ function! s:TermChangedHandler() abort
         autocmd TermChanged * call s:TermChangedHandler()
     augroup END
 
-    " Select a function to 'communicate' with a supported terminal.
-    "
-    " TODO: Identify terminals in tmux sessions, where TERM_PROGRAM and
-    " TERM are changed.  Use its 'show-environment' command, maybe?
-    if $TERM_PROGRAM ==# 'Apple_Terminal'
-                \ || &term =~# '^nsterm-\|^nsterm$\|^Apple_Terminal$'
-        let s:SetCwds = function('termcwd#nsterm#SetCwds')
-    else
-        unlet! s:SetCwds
+    " Pick the functions for assembling control sequences and sending
+    " them to the terminal.
+    try
+        let s:SetCwds = s:ChooseSetCwds()
+    catch /\m\C^termcwd(ChooseSetCwds):/
+        unlet! s:SendCtrlSeq s:SetCwds
         return
-    endif
+    endtry
+    let s:SendCtrlSeq = s:ChooseSendCtrlSeq()
 
+    " Remember to guard autocommands that use events unavailable in 7.2.
     augroup termcwd
         " Handle naming an unnamed buffer with :write or :update.
         autocmd BufAdd * call s:StdHandler()
@@ -128,11 +192,11 @@ function! s:TermChangedHandler() abort
         autocmd BufFilePost * call s:BufFilePostHandler()
 
         " Handle entering the command-line window.
-        if exists('##CmdwinEnter')
-            autocmd CmdwinEnter * call s:StdHandler()
-        endif
+        autocmd CmdwinEnter * call s:StdHandler()
 
-        " Handle changing the current directory.
+        " Handle changing the current directory.  This only matters in
+        " fileless windows because the other autocommands update the
+        " directory too.  Requires patch 8.0.1459.
         if exists('##DirChanged')
             autocmd DirChanged * call s:StdHandler(expand('%:p'))
         endif
@@ -140,22 +204,27 @@ function! s:TermChangedHandler() abort
         " Handle returning from :shell.
         autocmd ShellCmdPost * call s:StdHandler()
 
-        " Handle the initial entrance to a windowed terminal buffer.
-        if exists('##TerminalWinOpen')
-            autocmd TerminalWinOpen * call s:StdHandler()
+        " Handle the initial entrance to a terminal buffer.  Requires
+        " patch 8.0.1596 but is more portable than `TerminalWinOpen`,
+        " which needs 8.1.2219.  I think StdHandler's current-buffer
+        " check is sufficient to weed out unwanted events, but if not,
+        " switching to `TerminalWinOpen` would be fine.
+        if exists('##TerminalOpen')
+            autocmd TerminalOpen * call s:StdHandler()
         endif
 
         " Handle ceding control to another process.  Leave a clean slate
         " because there's no way to know whether that process will set
         " its own directory and document (although 'no' is a safe bet).
-        autocmd VimLeave * call s:SetCwds('', '')
+        " Handling suspension requires patch 8.2.2128.
+        autocmd VimLeave * call s:SetCwds('', '', s:SendCtrlSeq)
         if exists('##VimSuspend')
-            autocmd VimSuspend * call s:SetCwds('', '')
+            autocmd VimSuspend * call s:SetCwds('', '', s:SendCtrlSeq)
         endif
 
         " Handle resuming after suspension.  Can't use the standard
         " handler because '<abuf>' is always empty.  Use '%:p' because
-        " '<amatch>' is always empty.
+        " '<amatch>' is also always empty.  Requires patch 8.2.2128.
         if exists('##VimResume')
             autocmd VimResume * call s:BasicHandler(expand('%:p'))
         endif
@@ -174,3 +243,9 @@ call s:TermChangedHandler()
 
 let &cpoptions = s:saved_cpoptions
 unlet s:saved_cpoptions
+
+
+" References
+"
+"  1. https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+"  2. https://en.wikipedia.org/wiki/C0_and_C1_control_codes
